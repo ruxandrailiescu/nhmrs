@@ -114,8 +114,9 @@ class raw_env(ParallelEnv, EzPickle):
         "render_fps": 30,
     }
     
-    def __init__(self, scenario=None, render_mode=None, max_steps=500, 
-                 kinematics=None, agent_size=0.075):
+    def __init__(self, scenario=None, render_mode=None, max_steps=500,
+                 kinematics=None, agent_size=0.075, n_agents=3, n_landmarks=4,
+                 observe_relative=True):
         EzPickle.__init__(
             self,
             scenario=scenario,
@@ -123,12 +124,15 @@ class raw_env(ParallelEnv, EzPickle):
             max_steps=max_steps,
             kinematics=kinematics,
             agent_size=agent_size,
+            n_agents=n_agents,
+            n_landmarks=n_landmarks,
+            observe_relative=observe_relative,
         )
         super().__init__()
         
         # Create scenario and world using core abstractions
-        self.scenario = scenario if scenario is not None else Scenario()
-        self.world = self.scenario.make_world()
+        self.scenario = scenario if scenario is not None else Scenario(observe_relative=observe_relative)
+        self.world = self.scenario.make_world(n_agents=n_agents, n_landmarks=n_landmarks)
         self.max_steps = max_steps
         self.render_mode = render_mode
         self.agent_size = agent_size
@@ -408,7 +412,7 @@ class Scenario(BaseScenario):
         reward_computer (SimpleAssignmentReward | SimpleSpreadReward): Computes per-agent rewards
     """
     
-    def __init__(self, reward_mode='spread'):
+    def __init__(self, reward_mode='spread', observe_relative=True):
         """Initialize scenario with reward configuration.
         
         Args:
@@ -417,8 +421,12 @@ class Scenario(BaseScenario):
                 - 'simple': Assignment + collision only (fast learning)
                 - 'balanced': Full reward with all components
                 - 'patrol': Optimized for N < M persistent coverage
+            observe_relative: If True, landmark and other-agent positions are
+                expressed as offsets from the observing agent (translation-invariant).
+                If False, raw world-frame coordinates are used. Default True.
         """
         self.reward_mode = reward_mode
+        self.observe_relative = observe_relative
         self.reward_computer = None
     
     def make_world(self, n_agents=3, n_landmarks=4):
@@ -567,40 +575,54 @@ class Scenario(BaseScenario):
     
     def observation(self, agent, world):
         """Construct observation vector for one agent.
-        
-        Observation structure:
-            [own_x, own_y, own_θ,                         # 3 values
-             lm1_x, lm1_y, lm2_x, lm2_y, ..., lmM_x, lmM_y,  # 2*M values
-             other1_x, other1_y, other1_θ, ..., otherN_x, otherN_y, otherN_θ]  # 3*(N-1) values
-        
-        Total size: 3 + 2*M + 3*(N-1)
-        
+
+        Observation structure (observe_relative=True):
+            [own_x, own_y, own_θ,                              # 3 values (world frame)
+             lm1_Δx, lm1_Δy, ..., lmM_Δx, lmM_Δy,            # 2*M values (relative)
+             other1_Δx, other1_Δy, other1_Δθ, ...]            # 3*(N-1) values (relative)
+
+        Observation structure (observe_relative=False):
+            [own_x, own_y, own_θ,                              # 3 values (world frame)
+             lm1_x, lm1_y, ..., lmM_x, lmM_y,                 # 2*M values (world frame)
+             other1_x, other1_y, other1_θ, ...]                # 3*(N-1) values (world frame)
+
+        Total size: 3 + 2*M + 3*(N-1) in both cases.
+
         Args:
             agent: Agent to observe for
             world: World with agents and landmarks
-            
+
         Returns:
             np.ndarray: Observation vector, shape (obs_dim,)
         """
-        # Own state: [x, y, theta]
         own_state = np.array([
             agent.state.p_pos[0],
             agent.state.p_pos[1],
             agent.state.p_orient
         ], dtype=np.float32)
-        
-        # Landmark positions
-        landmark_pos = np.concatenate([lm.state.p_pos for lm in world.landmarks])
-        
-        # Other agent states
-        other_states = []
-        for other in world.agents:
-            if other is not agent:
-                other_states.extend([
-                    other.state.p_pos[0],
-                    other.state.p_pos[1],
-                    other.state.p_orient
-                ])
-        other_states = np.array(other_states, dtype=np.float32)
-        
-        return np.concatenate([own_state, landmark_pos, other_states])
+
+        if self.observe_relative:
+            landmark_pos = np.concatenate([
+                lm.state.p_pos - agent.state.p_pos for lm in world.landmarks
+            ])
+            other_states = []
+            for other in world.agents:
+                if other is not agent:
+                    rel_pos = other.state.p_pos - agent.state.p_pos
+                    rel_orient = other.state.p_orient - agent.state.p_orient
+                    # Normalize relative orientation to [-π, π]
+                    rel_orient = np.arctan2(np.sin(rel_orient), np.cos(rel_orient))
+                    other_states.extend([rel_pos[0], rel_pos[1], rel_orient])
+        else:
+            landmark_pos = np.concatenate([lm.state.p_pos for lm in world.landmarks])
+            other_states = []
+            for other in world.agents:
+                if other is not agent:
+                    other_states.extend([
+                        other.state.p_pos[0],
+                        other.state.p_pos[1],
+                        other.state.p_orient
+                    ])
+
+        return np.concatenate([own_state, landmark_pos,
+                                np.array(other_states, dtype=np.float32)])
